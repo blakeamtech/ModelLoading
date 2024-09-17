@@ -15,7 +15,6 @@ logger = logging.getLogger(__name__)
 # Device configuration (use GPU if available, otherwise fallback to CPU)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
 class InferenceService:
     def __init__(self, authentication_key: str):
         try:
@@ -25,21 +24,27 @@ class InferenceService:
             # Clear GPU memory before loading the model
             torch.cuda.empty_cache()
 
-            # Load custom model and tokenizer
+            # Load custom model and tokenizer with memory optimizations
             logger.info(f"Loading custom model from {model_dir} on device: {device}")
 
-            # Load model using full precision for better output quality
+            # Load model using FP16 (half precision) for memory savings
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_dir, trust_remote_code=True
-            ).to(device)  # Full precision (FP32)
+            ).half().to(device)  # FP16
 
             self.tokenizer = AutoTokenizer.from_pretrained(model_dir)
+
+            # Enable gradient checkpointing for additional memory efficiency
+            self.model.gradient_checkpointing_enable()
+
+            # Clear any residual memory after model loading
+            torch.cuda.empty_cache()
 
             # Initialize authentication service
             self.authentication_key = authentication_key
             self.authentication_service = AuthenticationService(authentication_key)
 
-            logger.info("Model and tokenizer successfully loaded.")
+            logger.info("Model and tokenizer successfully loaded with optimizations.")
 
         except torch.cuda.OutOfMemoryError as oom:
             logger.error("CUDA Out of Memory Error during model loading", exc_info=True)
@@ -49,34 +54,28 @@ class InferenceService:
         except Exception as e:
             logger.error(f"Error loading custom model or tokenizer: {e}", exc_info=True)
             raise RuntimeError(f"Error loading custom model or tokenizer: {str(e)}")
-
-    def generate_text(self, input_context: str, max_length: int = 128, temperature: float = 0.7) -> str:
+    def generate_text(self, input_context: str, max_length: int = 512, temperature: float = 0.3) -> str:
         """
-        Generate text from the custom model with careful hyperparameter tuning for quality output.
+        Generate text from the custom model with a batch size of 1 and all possible memory optimizations.
         """
         try:
-            # Read the prompt template
             with open('/workspace/lo-backend/prompt.txt', 'r') as file:
-                prompt = file.read()
+               if input_context:
+                  input_context = f"{input_context}." if input_context[-1] not in ['?', '!', '.'] else input_context
+               else:
+                  input_context = ""
+               prompt = file.read().replace('<<CONTEXT>>', f"context: {input_context}")
 
-            # Clean up and append input context properly
-            if input_context:
-                input_context = f"{input_context}." if input_context[-1] not in ['?', '!', '.'] else input_context
-            else:
-                input_context = ""
-            prompt = prompt.replace('<<CONTEXT>>', input_context)
-
-            # Tokenize the input context with truncation for long inputs
-            input_ids = self.tokenizer.encode(
-                prompt, return_tensors="pt", truncation=True, padding=True
-            ).to(device)
+            # Tokenize the input context with truncation and padding to ensure batch size of 1
+            input_ids = self.tokenizer.encode(prompt, return_tensors="pt", truncation=True, padding=True).to(device)
 
             # Ensure batch size is 1
             assert input_ids.shape[0] == 1, "Batch size is not 1"
 
-            # Perform inference using full precision and no gradients
-            with torch.no_grad():
-                output = self.model.generate(input_ids, max_length=max_length, temperature=temperature)
+            # Perform inference using mixed precision and no gradients
+            with torch.no_grad():  # Ensure no gradients are computed
+                with autocast():  # Use FP16 inference for memory savings
+                    output = self.model.generate(input_ids, max_length=max_length, temperature=temperature)
 
             # Clear GPU memory after inference to avoid memory fragmentation
             torch.cuda.empty_cache()
@@ -84,9 +83,7 @@ class InferenceService:
             # Decode the generated output
             generated_text = self.tokenizer.decode(output[0], skip_special_tokens=True)
 
-            # Clean up the generated output by removing extra prefixes if necessary
             generated_text = generated_text.split('<bot>:')[-1].strip()
-
             logger.info(f"Generated text: {generated_text}")
             return generated_text
 
@@ -112,9 +109,10 @@ class InferenceService:
                 # Tokenize the batch of inputs efficiently with padding and truncation
                 input_ids = self.tokenizer(batch, return_tensors="pt", padding=True, truncation=True).to(device)
 
-                # Perform inference on each batch with full precision
+                # Perform inference on each batch with mixed precision
                 with torch.no_grad():
-                    outputs = self.model.generate(input_ids, max_length=max_length, temperature=temperature)
+                    with autocast():
+                        outputs = self.model.generate(input_ids, max_length=max_length, temperature=temperature)
 
                 # Decode outputs for each batch element
                 batch_texts = [self.tokenizer.decode(output, skip_special_tokens=True) for output in outputs]
